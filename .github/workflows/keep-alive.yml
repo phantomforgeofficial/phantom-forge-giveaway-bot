@@ -1,0 +1,16 @@
+name: Keep Render Awake
+
+on:
+  schedule:
+    - cron: "*/2 * * * *"   # elke 5 minuten
+  workflow_dispatch:        # handmatig starten kan ook
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Curl /health
+        run: |
+          curl -sSfL "$HEALTH_URL"
+        env:
+          HEALTH_URL: "https://phantom-forge-giveaway-bot.onrender.com/health"
