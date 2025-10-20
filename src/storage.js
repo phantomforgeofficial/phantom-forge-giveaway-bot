@@ -4,8 +4,14 @@ const DB_PATH = './data/giveaways.json';
 
 async function ensureDb() {
   await fs.ensureFile(DB_PATH);
-  try { await fs.readJSON(DB_PATH); }
-  catch { await fs.writeJSON(DB_PATH, { giveaways: [] }, { spaces: 2 }); }
+  try {
+    const data = await fs.readJSON(DB_PATH);
+    if (!('giveaways' in data)) data.giveaways = [];
+    if (!('meta' in data)) data.meta = { statusMessageId: null };
+    await fs.writeJSON(DB_PATH, data, { spaces: 2 });
+  } catch {
+    await fs.writeJSON(DB_PATH, { giveaways: [], meta: { statusMessageId: null } }, { spaces: 2 });
+  }
 }
 
 export async function loadDb() {
@@ -17,6 +23,7 @@ export async function saveDb(db) {
   await fs.writeJSON(DB_PATH, db, { spaces: 2 });
 }
 
+/* ---- Giveaway functions ---- */
 export async function addGiveaway(gw) {
   const db = await loadDb();
   db.giveaways.push(gw);
@@ -44,4 +51,17 @@ export async function listGiveaways(filter = {}) {
     for (const [k, v] of Object.entries(filter)) if (g[k] !== v) return false;
     return true;
   });
+}
+
+/* ---- Status panel functions ---- */
+export async function getStatusMessageId() {
+  const db = await loadDb();
+  return db.meta?.statusMessageId || null;
+}
+
+export async function setStatusMessageId(id) {
+  const db = await loadDb();
+  db.meta = db.meta || {};
+  db.meta.statusMessageId = id;
+  await saveDb(db);
 }
