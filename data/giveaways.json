@@ -1,3 +1,6 @@
 {
-  "giveaways": []
+  "giveaways": [],
+  "meta": {
+    "statusMessageId": null
+  }
 }
