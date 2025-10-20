@@ -1,36 +1,35 @@
 import 'dotenv/config';
 import express from 'express';
 import {
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  ChannelType,
-  Client,
-  Collection,
-  EmbedBuilder,
-  GatewayIntentBits,
-  Partials,
-  Routes,
-  SlashCommandBuilder,
-  REST
+  ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client,
+  Collection, EmbedBuilder, GatewayIntentBits, Partials,
+  Routes, SlashCommandBuilder, REST
 } from 'discord.js';
-import { addGiveaway, getGiveaway, listGiveaways, updateGiveaway } from './storage.js';
+import {
+  addGiveaway, getGiveaway, listGiveaways, updateGiveaway,
+  getStatusMessageId, setStatusMessageId
+} from './storage.js';
 
+/* === THEME / BRANDING === */
 const PURPLE = 0x8000ff;
 const SERVER_NAME = process.env.SERVER_NAME || 'Phantom Forge';
 const LOGO_URL = process.env.LOGO_URL || null;
+
+/* === FIXED STATUS CHANNEL === */
+const STATUS_CHANNEL_ID = '1429121620194234478'; // always post status here
+
+/* === OPTIONAL DEFAULT GIVEAWAY CHANNEL (for /gstart) === */
 const DEFAULT_CHANNEL_ID = process.env.DEFAULT_CHANNEL_ID || null;
 
 /* ---------- Helpers ---------- */
 function parseDuration(str) {
-  const regex = /(\d+)\s*(d|h|m|s)/gi;
-  let ms = 0, m;
-  while ((m = regex.exec(str))) {
-    const val = Number(m[1]); const u = m[2].toLowerCase();
-    if (u === 'd') ms += val * 86400000;
-    if (u === 'h') ms += val * 3600000;
-    if (u === 'm') ms += val * 60000;
-    if (u === 's') ms += val * 1000;
+  const re = /(\d+)\s*(d|h|m|s)/gi; let ms = 0, m;
+  while ((m = re.exec(str))) {
+    const v = +m[1]; const u = m[2].toLowerCase();
+    if (u === 'd') ms += v * 86400000;
+    if (u === 'h') ms += v * 3600000;
+    if (u === 'm') ms += v * 60000;
+    if (u === 's') ms += v * 1000;
   }
   return ms;
 }
@@ -38,6 +37,16 @@ function parseDuration(str) {
 function fmtDelta(ms) {
   if (ms < 0) ms = 0;
   const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = n => String(n).padStart(2, '0');
+  return `${pad(h)}:${pad(m)}:${pad(sec)}`;
+}
+
+function humanEnds(ms) {
+  // for short “Ends in” style (still used in giveaways)
+  const s = Math.max(0, Math.floor(ms / 1000));
   const d = Math.floor(s / 86400);
   const h = Math.floor((s % 86400) / 3600);
   const m = Math.floor((s % 3600) / 60);
@@ -50,8 +59,8 @@ function fmtDelta(ms) {
   return parts.join(' ');
 }
 
-function pickWinners(participants, count) {
-  const pool = [...new Set(participants)];
+function pickWinners(arr, count) {
+  const pool = [...new Set(arr)];
   const winners = [];
   while (winners.length < count && pool.length) {
     const i = Math.floor(Math.random() * pool.length);
@@ -60,7 +69,8 @@ function pickWinners(participants, count) {
   return winners;
 }
 
-function makeEmbed({ prize, winners, endsAt, entriesCount, ended }) {
+/* ---------- Giveaway Embeds ---------- */
+function makeGiveawayEmbed({ prize, winners, endsAt, entriesCount, ended }) {
   const e = new EmbedBuilder()
     .setTitle('🎉 Phantom Forge Giveaway')
     .setDescription(`**Prize:** ${prize}\n**Winners:** ${winners}`)
@@ -71,85 +81,121 @@ function makeEmbed({ prize, winners, endsAt, entriesCount, ended }) {
       iconURL: LOGO_URL || undefined
     });
 
+  const entriesField = { name: '👥 Entries', value: `**${entriesCount}**`, inline: true };
   if (!ended) {
     e.addFields(
-      { name: '⏰ Ends in', value: `**${fmtDelta(endsAt - Date.now())}**`, inline: true },
-      { name: '👥 Entries', value: `**${entriesCount}**`, inline: true }
+      { name: '⏰ Ends in', value: `**${humanEnds(endsAt - Date.now())}**`, inline: true },
+      entriesField
     );
   } else {
-    e.addFields({ name: '👥 Entries', value: `**${entriesCount}**`, inline: true });
+    e.addFields(entriesField);
   }
   return e;
 }
 
-const joinId = (id) => `gw_join_${id}`;
+const joinId = id => `gw_join_${id}`;
 const components = (id, ended) => ([
   new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(joinId(id))
       .setLabel(ended ? 'Ended' : 'Join / Leave')
       .setEmoji('🎉')
-      // purple style (closest Discord allows)
-      .setStyle(ButtonStyle.Secondary)
+      .setStyle(ButtonStyle.Secondary) // closest to purple
       .setDisabled(!!ended)
   )
 ]);
 
 /* ---------- Discord Client ---------- */
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
-  partials: [Partials.Channel]
-});
-
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers], partials: [Partials.Channel] });
 const participantCache = new Collection();
 
 /* ---------- Slash Commands ---------- */
 const commandData = [
   new SlashCommandBuilder()
-    .setName('gstart')
-    .setDescription('Start a giveaway')
+    .setName('gstart').setDescription('Start a giveaway')
     .addStringOption(o => o.setName('duration').setDescription('e.g., 1h30m, 45m, 2d').setRequired(true))
     .addStringOption(o => o.setName('prize').setDescription('Prize name').setRequired(true))
     .addIntegerOption(o => o.setName('winners').setDescription('Number of winners (default 1)').setMinValue(1))
     .addChannelOption(o => o.setName('channel').setDescription('Channel to post the giveaway').addChannelTypes(ChannelType.GuildText)),
   new SlashCommandBuilder()
-    .setName('gend')
-    .setDescription('End a giveaway early')
+    .setName('gend').setDescription('End a giveaway early')
     .addStringOption(o => o.setName('message_id').setDescription('Giveaway message ID').setRequired(true)),
   new SlashCommandBuilder()
-    .setName('greroll')
-    .setDescription('Reroll the winners of a giveaway')
+    .setName('greroll').setDescription('Reroll the winners of a giveaway')
     .addStringOption(o => o.setName('message_id').setDescription('Giveaway message ID').setRequired(true)),
   new SlashCommandBuilder()
-    .setName('glist')
-    .setDescription('Show all active giveaways')
+    .setName('glist').setDescription('Show all active giveaways')
 ].map(c => c.toJSON());
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   const { CLIENT_ID, GUILD_ID } = process.env;
   if (!CLIENT_ID) throw new Error('CLIENT_ID missing in .env');
-
-  if (GUILD_ID) {
+  if (GUILD_ID)
     await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commandData });
-    console.log('✅ Guild slash commands registered');
-  } else {
+  else
     await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commandData });
-    console.log('🌍 Global slash commands registered (may take up to ~1h)');
-  }
 }
 
 /* ---------- Presence ---------- */
-async function setWatching() {
+function setWatching() {
   const g = client.guilds.cache.first();
-  client.user?.setPresence({
-    activities: [{ name: g?.name || SERVER_NAME, type: 3 }],
-    status: 'online'
-  });
+  client.user?.setPresence({ activities: [{ name: g?.name || SERVER_NAME, type: 3 }], status: 'online' });
 }
 
-/* ---------- Update loop ---------- */
-async function updateLoop() {
+/* ---------- STATUS PANEL (edit same message each second) ---------- */
+function buildStatusEmbed() {
+  const now = new Date();
+  const uptime = fmtDelta(process.uptime() * 1000);
+  const ping = Math.max(0, Math.round(client.ws.ping)) || 0;
+  const e = new EmbedBuilder()
+    .setColor(PURPLE)
+    .setTitle('🕒 Phantom Forge Giveaway Bot Status')
+    .setDescription('')
+    .addFields(
+      { name: 'Active:', value: '✅ Online', inline: true },
+      { name: 'Ping', value: `${ping} ms`, inline: true },
+      { name: 'Uptime', value: '`' + uptime + '`', inline: false },
+      { name: 'Last update', value: now.toLocaleString('en-US'), inline: false }
+    )
+    .setFooter({
+      text: `Live updated every second | ${SERVER_NAME} • today at ${now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`,
+      iconURL: LOGO_URL || undefined
+    });
+  return e;
+}
+
+async function ensureStatusMessage() {
+  const channel = await client.channels.fetch(STATUS_CHANNEL_ID).catch(() => null);
+  if (!channel || channel.type !== ChannelType.GuildText) return null;
+
+  const existingId = await getStatusMessageId();
+  if (existingId) {
+    const msg = await channel.messages.fetch(existingId).catch(() => null);
+    if (msg) return msg;
+  }
+
+  // Create once and remember its ID
+  const created = await channel.send({ embeds: [buildStatusEmbed()] });
+  await setStatusMessageId(created.id);
+  return created;
+}
+
+async function tickStatus() {
+  const channel = await client.channels.fetch(STATUS_CHANNEL_ID).catch(() => null);
+  if (!channel || channel.type !== ChannelType.GuildText) return;
+
+  const id = await getStatusMessageId();
+  let msg = id ? await channel.messages.fetch(id).catch(() => null) : null;
+  if (!msg) msg = await ensureStatusMessage();
+
+  if (msg) {
+    await msg.edit({ embeds: [buildStatusEmbed()] }).catch(() => {});
+  }
+}
+
+/* ---------- Giveaway Updater ---------- */
+async function updateGiveaways() {
   const active = await listGiveaways({ ended: false });
   for (const gw of active) {
     try {
@@ -159,22 +205,16 @@ async function updateLoop() {
 
       const msg = await channel.messages.fetch(gw.messageId);
       const entries = participantCache.get(gw.id)?.size ?? gw.participants.length;
-      const now = Date.now();
-      if (now >= gw.endsAt) {
-        await endGiveaway(gw, { announce: true });
-        continue;
-      }
-      const embed = makeEmbed({
-        prize: gw.prize,
-        winners: gw.winners,
-        endsAt: gw.endsAt,
-        entriesCount: entries,
-        ended: false
+
+      if (Date.now() >= gw.endsAt) { await endGiveaway(gw, { announce: true }); continue; }
+
+      await msg.edit({
+        embeds: [makeGiveawayEmbed({
+          prize: gw.prize, winners: gw.winners, endsAt: gw.endsAt, entriesCount: entries, ended: false
+        })],
+        components: components(gw.id, false)
       });
-      await msg.edit({ embeds: [embed], components: components(gw.id, false) });
-    } catch (e) {
-      console.error(`Update error for ${gw.id}:`, e?.message || e);
-    }
+    } catch { /* ignore */ }
   }
 }
 
@@ -193,12 +233,9 @@ async function endGiveaway(gw, { announce = true, reroll = false } = {}) {
   const winners = pickWinners(participants, gw.winners);
   await updateGiveaway(gw.id, { ended: true, winnersPicked: winners });
 
-  const endedEmbed = makeEmbed({
-    prize: gw.prize,
-    winners: gw.winners,
-    endsAt: gw.endsAt,
-    entriesCount: participants.length,
-    ended: true
+  const endedEmbed = makeGiveawayEmbed({
+    prize: gw.prize, winners: gw.winners, endsAt: gw.endsAt,
+    entriesCount: participants.length, ended: true
   });
 
   if (message) await message.edit({ embeds: [endedEmbed], components: components(gw.id, true) });
@@ -223,42 +260,36 @@ client.on('interactionCreate', async (i) => {
       const durStr = i.options.getString('duration', true);
       const prize = i.options.getString('prize', true);
       const winners = i.options.getInteger('winners') ?? 1;
-      let target = i.options.getChannel('channel') || i.channel;
-
-      if (DEFAULT_CHANNEL_ID) {
-        const g = await client.guilds.fetch(i.guildId);
-        target = await g.channels.fetch(DEFAULT_CHANNEL_ID) || target;
-      }
 
       const ms = parseDuration(durStr);
       if (!ms || ms < 5000) return i.reply({ content: 'Invalid duration (e.g., 45m, 1h30m, 2d).', ephemeral: true });
 
+      let target = i.options.getChannel('channel') || i.channel;
+      if (DEFAULT_CHANNEL_ID) {
+        const g = await client.guilds.fetch(i.guildId);
+        target = await g.channels.fetch(DEFAULT_CHANNEL_ID) || target;
+      }
+      if (target.type !== ChannelType.GuildText) {
+        return i.reply({ content: 'Please choose a text channel.', ephemeral: true });
+      }
+
       const endsAt = Date.now() + ms;
-      const embed = makeEmbed({
-        prize, winners, endsAt, entriesCount: 0, ended: false
+      const msg = await target.send({
+        embeds: [makeGiveawayEmbed({ prize, winners, endsAt, entriesCount: 0, ended: false })],
+        components: components('temp', false)
       });
 
-      const msg = await target.send({ embeds: [embed], components: components('temp', false) });
-
       const gw = {
-        id: msg.id,
-        messageId: msg.id,
-        channelId: target.id,
-        guildId: i.guildId,
-        prize,
-        winners,
-        createdAt: Date.now(),
-        endsAt,
-        participants: [],
-        ended: false,
-        winnersPicked: []
+        id: msg.id, messageId: msg.id, channelId: target.id, guildId: i.guildId,
+        prize, winners, createdAt: Date.now(), endsAt, participants: [],
+        ended: false, winnersPicked: []
       };
 
       await msg.edit({ components: components(gw.id, false) });
       await addGiveaway(gw);
       participantCache.set(gw.id, new Set());
 
-      await i.reply({ content: `Giveaway started in <#${target.id}> for **${prize}**. Ends in **${fmtDelta(ms)}**.`, ephemeral: true });
+      await i.reply({ content: `Giveaway started in <#${target.id}> for **${prize}**. Ends in **${humanEnds(ms)}**.`, ephemeral: true });
     }
 
     if (i.commandName === 'gend') {
@@ -287,7 +318,7 @@ client.on('interactionCreate', async (i) => {
     if (i.commandName === 'glist') {
       const active = await listGiveaways({ ended: false });
       if (!active.length) return i.reply({ content: 'No active giveaways.', ephemeral: true });
-      const lines = active.map(g => `• **${g.prize}** — ends in \`${fmtDelta(g.endsAt - Date.now())}\` (<#${g.channelId}>)`);
+      const lines = active.map(g => `• **${g.prize}** — ends in \`${humanEnds(g.endsAt - Date.now())}\` (<#${g.channelId}>)`);
       return i.reply({ content: lines.join('\n'), ephemeral: true });
     }
   }
@@ -317,23 +348,27 @@ client.on('interactionCreate', async (i) => {
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   await registerCommands();
-  await setWatching();
+  setWatching();
 
+  // hydrate cache
   const active = await listGiveaways({ ended: false });
   for (const gw of active) participantCache.set(gw.id, new Set(gw.participants));
 
-  setInterval(updateLoop, 5000);
+  // ensure the status panel exists and start 1s updates
+  await ensureStatusMessage();
+  setInterval(tickStatus, 1000);
+
+  // giveaways refresh (5s is enough)
+  setInterval(updateGiveaways, 5000);
 });
 
-client.on('guildCreate', setWatching);
-client.on('guildDelete', setWatching);
-
-/* ---------- Health Endpoint ---------- */
+/* ---------- Express health ---------- */
 const app = express();
 app.get('/', (_, res) => res.send('OK'));
 app.get('/health', (_, res) => res.json({ ok: true, uptime: process.uptime() }));
 app.listen(process.env.PORT || 3000, () => console.log('🌐 Health endpoint running'));
 
+/* ---------- Boot ---------- */
 if (!process.env.DISCORD_TOKEN) {
   console.error('❌ Missing DISCORD_TOKEN in .env');
   process.exit(1);
