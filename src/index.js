@@ -23,7 +23,6 @@ const DEFAULT_CHANNEL_ID = process.env.DEFAULT_CHANNEL_ID || null;
 
 /* ---------- Helpers ---------- */
 function parseDuration(str) {
-  // Supports: 2d, 3h, 45m, 30s, combos like 1h30m
   const regex = /(\d+)\s*(d|h|m|s)/gi;
   let ms = 0, m;
   while ((m = regex.exec(str))) {
@@ -61,7 +60,7 @@ function pickWinners(participants, count) {
   return winners;
 }
 
-function makeEmbed({ prize, winners, endsAt, entrantsCount, ended, guildName }) {
+function makeEmbed({ prize, winners, endsAt, entriesCount, ended }) {
   const e = new EmbedBuilder()
     .setTitle('🎉 Phantom Forge Giveaway')
     .setDescription(`**Prize:** ${prize}\n**Winners:** ${winners}`)
@@ -75,11 +74,10 @@ function makeEmbed({ prize, winners, endsAt, entrantsCount, ended, guildName }) 
   if (!ended) {
     e.addFields(
       { name: '⏰ Ends in', value: `**${fmtDelta(endsAt - Date.now())}**`, inline: true },
-      { name: '👥 Entrants', value: `**${entrantsCount}**`, inline: true },
-      { name: '📺 Server', value: guildName || SERVER_NAME, inline: true }
+      { name: '👥 Entries', value: `**${entriesCount}**`, inline: true }
     );
   } else {
-    e.addFields({ name: '👥 Entrants', value: `**${entrantsCount}**`, inline: true });
+    e.addFields({ name: '👥 Entries', value: `**${entriesCount}**`, inline: true });
   }
   return e;
 }
@@ -91,7 +89,8 @@ const components = (id, ended) => ([
       .setCustomId(joinId(id))
       .setLabel(ended ? 'Ended' : 'Join / Leave')
       .setEmoji('🎉')
-      .setStyle(ended ? ButtonStyle.Secondary : ButtonStyle.Primary)
+      // purple style (closest Discord allows)
+      .setStyle(ButtonStyle.Secondary)
       .setDisabled(!!ended)
   )
 ]);
@@ -102,10 +101,9 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// In-memory set for quick toggles; persisted to JSON too
 const participantCache = new Collection();
 
-/* ---------- Slash Commands (defined & registered on startup) ---------- */
+/* ---------- Slash Commands ---------- */
 const commandData = [
   new SlashCommandBuilder()
     .setName('gstart')
@@ -145,12 +143,12 @@ async function registerCommands() {
 async function setWatching() {
   const g = client.guilds.cache.first();
   client.user?.setPresence({
-    activities: [{ name: g?.name || SERVER_NAME, type: 3 }], // WATCHING
+    activities: [{ name: g?.name || SERVER_NAME, type: 3 }],
     status: 'online'
   });
 }
 
-/* ---------- Updater Loop ---------- */
+/* ---------- Update loop ---------- */
 async function updateLoop() {
   const active = await listGiveaways({ ended: false });
   for (const gw of active) {
@@ -160,7 +158,7 @@ async function updateLoop() {
       if (!channel || channel.type !== ChannelType.GuildText) continue;
 
       const msg = await channel.messages.fetch(gw.messageId);
-      const entrants = participantCache.get(gw.id)?.size ?? gw.participants.length;
+      const entries = participantCache.get(gw.id)?.size ?? gw.participants.length;
       const now = Date.now();
       if (now >= gw.endsAt) {
         await endGiveaway(gw, { announce: true });
@@ -170,9 +168,8 @@ async function updateLoop() {
         prize: gw.prize,
         winners: gw.winners,
         endsAt: gw.endsAt,
-        entrantsCount: entrants,
-        ended: false,
-        guildName: guild.name
+        entriesCount: entries,
+        ended: false
       });
       await msg.edit({ embeds: [embed], components: components(gw.id, false) });
     } catch (e) {
@@ -200,9 +197,8 @@ async function endGiveaway(gw, { announce = true, reroll = false } = {}) {
     prize: gw.prize,
     winners: gw.winners,
     endsAt: gw.endsAt,
-    entrantsCount: participants.length,
-    ended: true,
-    guildName: guild.name
+    entriesCount: participants.length,
+    ended: true
   });
 
   if (message) await message.edit({ embeds: [endedEmbed], components: components(gw.id, true) });
@@ -213,7 +209,7 @@ async function endGiveaway(gw, { announce = true, reroll = false } = {}) {
     await channel.send({
       content: reroll
         ? `🔁 **Reroll!** New winners for **${gw.prize}**: ${mentions}`
-        : `🎉 **Giveaway ended!** Winners of **${gw.prize}**: ${mentions}\nCongratulations! Contact staff to claim your prize.`
+        : `🎉 **Giveaway ended!** Winners of **${gw.prize}**: ${mentions}\nCreate a ticket to claim your price!`
     });
   } else {
     await channel.send(`😕 No valid entries for **${gw.prize}**.`);
@@ -233,16 +229,13 @@ client.on('interactionCreate', async (i) => {
         const g = await client.guilds.fetch(i.guildId);
         target = await g.channels.fetch(DEFAULT_CHANNEL_ID) || target;
       }
-      if (target.type !== ChannelType.GuildText) {
-        return i.reply({ content: 'Please choose a text channel.', ephemeral: true });
-      }
 
       const ms = parseDuration(durStr);
       if (!ms || ms < 5000) return i.reply({ content: 'Invalid duration (e.g., 45m, 1h30m, 2d).', ephemeral: true });
 
       const endsAt = Date.now() + ms;
       const embed = makeEmbed({
-        prize, winners, endsAt, entrantsCount: 0, ended: false, guildName: i.guild?.name
+        prize, winners, endsAt, entriesCount: 0, ended: false
       });
 
       const msg = await target.send({ embeds: [embed], components: components('temp', false) });
@@ -329,20 +322,18 @@ client.once('ready', async () => {
   const active = await listGiveaways({ ended: false });
   for (const gw of active) participantCache.set(gw.id, new Set(gw.participants));
 
-  // Update embeds every 5s; extra 1s ticks near the end handled by this cadence well enough.
   setInterval(updateLoop, 5000);
 });
 
 client.on('guildCreate', setWatching);
 client.on('guildDelete', setWatching);
 
-/* ---------- Health Endpoint (Render) ---------- */
+/* ---------- Health Endpoint ---------- */
 const app = express();
 app.get('/', (_, res) => res.send('OK'));
 app.get('/health', (_, res) => res.json({ ok: true, uptime: process.uptime() }));
 app.listen(process.env.PORT || 3000, () => console.log('🌐 Health endpoint running'));
 
-/* ---------- Boot ---------- */
 if (!process.env.DISCORD_TOKEN) {
   console.error('❌ Missing DISCORD_TOKEN in .env');
   process.exit(1);
