@@ -1,0 +1,16 @@
+{
+  "name": "phantom-forge-giveaway-bot",
+  "version": "1.2.0",
+  "description": "Discord giveaway bot (English) • Phantom Forge branding • purple theme",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "fs-extra": "^11.2.0"
+  }
+}
